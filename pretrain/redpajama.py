@@ -48,7 +48,7 @@ fabric = 0
 learning_rate = 6e-4
 batch_size = 32
 micro_batch_size = 4
-max_iters = 60000  # 16 num_epochs * (epoch_size // micro_batch_size) // devices
+max_iters = 12  # 16 num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -90,7 +90,7 @@ def set_max_split_size_mb(model, max_split_size_mb):
 
 
 def main(
-    devices: int = 4,
+    devices: int = 8,
     train_data_dir: Path = "data/lit-redpajama-sample",
     val_data_dir: Optional[Path] = None,
 ) -> None:
