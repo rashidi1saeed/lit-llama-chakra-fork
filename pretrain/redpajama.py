@@ -24,20 +24,31 @@ from lit_llama.model import Block, LLaMA, LLaMAConfig
 from lit_llama.packed_dataset import PackedDataset, CombinedDataset
 from lit_llama.utils import save_model_checkpoint
 
+#profiler and graph observer
+from typing import Any, List, Optional
+from torch.profiler import _ExperimentalConfig, ExecutionGraphObserver
+import torch.profiler
+from datetime import datetime
+from time import perf_counter_ns as pc
+
+kineto_dir = "traces/kineto"
+pytorch_et_dir = "traces/et"
+
 
 out_dir = "out/training"
 save_interval = 1000
 eval_interval = 1000
 eval_iters = 100
 log_interval = 1
+fabric = 0
 
 # compile = False
 
 # Hyperparameters
 learning_rate = 6e-4
-batch_size = 125
-micro_batch_size = 5
-max_iters = 600000  # num_epochs * (epoch_size // micro_batch_size) // devices
+batch_size = 32
+micro_batch_size = 4
+max_iters = 60000  # 16 num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -50,21 +61,40 @@ min_lr = 6e-5
 
 # Data proportions from https://arxiv.org/pdf/2302.13971.pdf Table 1
 data_config = [
-    ("arxiv", 2.5),
-    ("book", 4.5),
-    ("c4", 15.0),
     ("cc", 67.0),
-    ("github", 4.5),
-    ("stackexchange", 2.0),
-    ("wikipedia", 4.5),
 ]
+
+def set_max_split_size_mb(model, max_split_size_mb):
+    """
+    Set the max_split_size_mb parameter in PyTorch to avoid fragmentation.
+    
+    Args:
+        model (torch.nn.Module): The PyTorch model.
+        max_split_size_mb (int): The desired value for max_split_size_mb in megabytes.
+    """
+    for param in model.parameters():
+        param.requires_grad = False  # Disable gradient calculation to prevent unnecessary memory allocations
+
+    # Dummy forward pass to initialize the memory allocator
+    dummy_input = torch.randn(1, 1)
+    model(dummy_input)
+
+    # Get the current memory allocator state
+    allocator = torch.cuda.memory._get_memory_allocator()
+
+    # Update max_split_size_mb in the memory allocator
+    allocator.set_max_split_size(max_split_size_mb * 1024 * 1024)
+
+    for param in model.parameters():
+        param.requires_grad = True  # Re-enable gradient calculation for training
 
 
 def main(
     devices: int = 4,
-    train_data_dir: Path = "data/lit-redpajama",
+    train_data_dir: Path = "data/lit-redpajama-sample",
     val_data_dir: Optional[Path] = None,
 ) -> None:
+    global fabric
     auto_wrap_policy = partial(
         transformer_auto_wrap_policy, transformer_layer_cls={Block}
     )
@@ -73,8 +103,9 @@ def main(
     )
 
     fabric = L.Fabric(
-        accelerator="cuda", devices=devices, precision="bf16-mixed", strategy=strategy
+        accelerator="cuda", devices=devices, precision="16-true", strategy=strategy
     )
+    
     fabric.launch()
     fabric.seed_everything(1337)
 
@@ -104,7 +135,8 @@ def main(
 
     # if compile:
     #     model = torch.compile(model)
-
+    
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -117,10 +149,16 @@ def main(
 
     process_batch_size = batch_size // devices
     gradient_accumulation_iters = process_batch_size // micro_batch_size
+    
+    #set_max_split_size_mb(model,4)
 
     train(fabric, model, optimizer, train_dataloader, val_dataloader, gradient_accumulation_iters, devices)
 
-
+def trace_handler(prof)-> Any:
+    kineto_file = "worker"+str(fabric.global_rank)+"_step_"+str(prof.step_num)
+    #prof.export_chrome_trace("./kineto_raw/" +kineto_file+ ".json")
+    torch.profiler.tensorboard_trace_handler(kineto_dir,worker_name=kineto_file).__call__(prof)
+    
 def train(
     fabric: L.Fabric,
     model: torch.nn.Module,
@@ -141,75 +179,113 @@ def train(
     tokens = 0
     tokens_sec = 0.0
     prev_t1 = time.time()
+    
+    #Saeed's code
+    eg_file = pytorch_et_dir+"/llama_et_"+str(fabric.global_rank)+".json"
+    eg = ExecutionGraphObserver()
+    eg.register_callback(eg_file)
+    
+    tic = 0
+    toc = 0
+    
+    with torch.autograd.profiler.profile(
+                enabled=True,
+                use_cuda=True,
+                use_kineto=True,
+            ) as _:
+                fabric.print("Running dummy profiler warmup for CUPTI.")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=5,
+            warmup=6,
+            active=1),
+        with_stack=False,
+        on_trace_ready=trace_handler,
+        record_shapes=True
+    ) as p:
+        for iter_num, train_data in enumerate(train_dataloader):
+            t0 = time.time()
 
-    for iter_num, train_data in enumerate(train_dataloader):
-        t0 = time.time()
+            if iter_num==10:
+                tic = pc()
+                eg.start()
+            
+            # determine and set the learning rate for this iteration
+            lr = get_lr(iter_num) if decay_lr else learning_rate
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
 
-
-        input_ids = train_data[:, 0 : model.config.block_size].contiguous()
-        targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
-        
-        is_accumulating = (iter_num + 1) % grad_accum_steps != 0
-
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
-            fabric.backward(loss / grad_accum_steps)
-
-        t1 = time.time()
-
-        if not is_accumulating:
-            fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
-
-            optimizer.step()
-            optimizer.zero_grad()
-            step_count += 1
+            input_ids = train_data[:, 0 : model.config.block_size].contiguous()
+            targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
+            
+            is_accumulating = (iter_num + 1) % grad_accum_steps != 0
+            
+                    
+            with fabric.no_backward_sync(model, enabled=is_accumulating):
+                logits = model(input_ids)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+                )
+                fabric.backward(loss / grad_accum_steps)
 
             t1 = time.time()
 
-            if val_dataloader is not None and step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_dataloader)
-                fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
-                fabric.barrier()
+            if not is_accumulating:
+                fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
+
+                optimizer.step()
+                optimizer.zero_grad()
+                step_count += 1
+
+                t1 = time.time()
+
+                if val_dataloader is not None and step_count % eval_interval == 0:
+                    val_loss = validate(fabric, model, val_dataloader)
+                    fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
+                    fabric.barrier()
+                    fabric.log_dict(
+                        {"iter": iter_num, "val_loss": val_loss, "step": step_count, "lr": lr}
+                    )
+
+                if step_count % save_interval == 0:
+                    fabric.print(f"Saving checkpoint to {out_dir}")
+                    save_model_checkpoint(
+                        fabric, model, os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth")
+                    )
+                    
+            if iter_num==10:
+                eg.stop()
+                toc = pc()
+                eg.unregister_callback()
+                print("exeution graph: "+pytorch_et_dir)
+                print("For GPU: "+str(fabric.global_rank)+" the training time is: "+str(toc-tic))
+            p.step()
+            
+            dt = t1 - t0
+
+            tokens += micro_batch_size * model.config.block_size
+            step_time += t1 - prev_t1
+            prev_t1 = t1
+            if iter_num % log_interval == 0:
+                tokens_sec_str = f"{tokens / step_time:.0f}" if not is_accumulating else "-"
+
                 fabric.log_dict(
-                    {"iter": iter_num, "val_loss": val_loss, "step": step_count, "lr": lr}
+                    {"iter": iter_num, "train_loss": loss, "step": step_count, "lr": lr}
+                )
+                fabric.print(
+                        f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms, speed: {tokens_sec_str} toks/s/device, rank: {fabric.global_rank}"
                 )
 
-            if step_count % save_interval == 0:
-                fabric.print(f"Saving checkpoint to {out_dir}")
-                save_model_checkpoint(
-                    fabric, model, os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth")
-                )
+            if not is_accumulating:
+                tokens = 0
+                step_time = 0.0
 
-        dt = t1 - t0
-
-        tokens += micro_batch_size * model.config.block_size
-        step_time += t1 - prev_t1
-        prev_t1 = t1
-
-        if iter_num % log_interval == 0:
-            tokens_sec_str = f"{tokens / step_time:.0f}" if not is_accumulating else "-"
-
-            fabric.log_dict(
-                {"iter": iter_num, "train_loss": loss, "step": step_count, "lr": lr}
-            )
-            fabric.print(
-                    f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms, speed: {tokens_sec_str} toks/s/device"
-            )
-
-        if not is_accumulating:
-            tokens = 0
-            step_time = 0.0
-
-        if iter_num > max_iters:
-            break
+            if iter_num > max_iters:
+                break
 
 
 @torch.no_grad()
